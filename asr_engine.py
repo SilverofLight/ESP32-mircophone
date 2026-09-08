@@ -468,6 +468,7 @@ class LiveTranscriber:
         self.min_last_samples = max(1, int(0.2 * 16000))
         self.language = _normalize_language(language)
         self.context = context or None
+        self.paste = False
         self.pending = np.zeros(0, dtype=np.float32)
 
     def feed_pcm16(self, data: bytes) -> None:
@@ -512,9 +513,13 @@ class LiveTranscriber:
             print(f"ASR : {text}")
             print(f"润色: {polished}")
             print("==============================")
+            if self.paste and polished:
+                from paste_input import paste_text
+
+                paste_text(polished)
         else:
             print("\n识别结果为空")
-        return text
+        return polished or text
 
 
 def _resample_linear(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
@@ -538,12 +543,14 @@ class StreamingRecognizer:
         use_gpu: bool = True,
         polish: bool = True,
         keep_models: bool = False,
+        paste: bool = True,
     ) -> None:
         self.language = language
         self.context = context
         self.use_gpu = use_gpu
         self.polish = polish
         self.keep_models = keep_models
+        self.paste = paste
         self._queue: queue.Queue = queue.Queue()
         self._thread = threading.Thread(target=self._loop, name="asr-worker", daemon=True)
         self._thread.start()
@@ -580,6 +587,7 @@ class StreamingRecognizer:
                         language=self.language,
                         context=self.context,
                     )
+                    live.paste = self.paste
                 elif cmd == "pcm" and live is not None:
                     live.feed_pcm16(payload)
                 elif cmd == "end":

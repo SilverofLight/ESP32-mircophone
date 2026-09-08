@@ -3,12 +3,14 @@
 
 ESP32-S3 只有 BLE。按下按钮开始推流，松开结束；PCM 不落盘。
 松开后加载 GPU 模型，识别整段并用 Qwen3-0.6B 润色口癖，然后卸掉显存。
+润色结果默认经 wl-copy + ydotool 粘贴到当前键盘焦点。
 
 示例:
   python receiver.py
   python receiver.py --name ESP32-MIC
   python receiver.py --address AA:BB:CC:DD:EE:FF
   python receiver.py --keep-models
+  python receiver.py --no-paste
 """
 
 from __future__ import annotations
@@ -178,6 +180,7 @@ async def run(args: argparse.Namespace) -> None:
                 use_gpu=not args.asr_cpu,
                 polish=not args.no_polish,
                 keep_models=args.keep_models,
+                paste=not args.no_paste,
             )
 
     session = RecordingSession(recognizer)
@@ -209,7 +212,10 @@ async def run(args: argparse.Namespace) -> None:
 
         await client.start_notify(STATUS_CHAR_UUID, on_status)
         await client.start_notify(AUDIO_CHAR_UUID, on_audio)
-        print("等待按下按钮说话，松开后加载模型并识别，Ctrl+C 退出")
+        hint = "松开后加载模型并识别"
+        if recognizer is not None and not args.no_paste:
+            hint += "，润色结果会粘贴到当前焦点"
+        print(f"等待按下按钮说话，{hint}，Ctrl+C 退出")
 
         try:
             while not disconnected.is_set():
@@ -255,6 +261,11 @@ def parse_args() -> argparse.Namespace:
         "--keep-models",
         action="store_true",
         help="识别后不卸载 GGUF，连续说话更快，但会一直占显存",
+    )
+    parser.add_argument(
+        "--no-paste",
+        action="store_true",
+        help="只打印结果，不把润色文本粘贴到当前焦点",
     )
     parser.add_argument("--asr-cpu", action="store_true", help="ASR 的 LLM 走 CPU，不用 Vulkan")
     parser.add_argument("--language", default="Chinese", help="识别语言，auto 表示自动检测")
