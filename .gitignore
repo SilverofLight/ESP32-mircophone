@@ -6,3 +6,6 @@ recordings/
 .pio/
 .build/
 .vscode/
+models/
+third_party/
+logs/

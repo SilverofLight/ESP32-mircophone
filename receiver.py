@@ -26,6 +26,8 @@ from bleak import BleakClient, BleakScanner
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 
+import asr_engine
+
 DEVICE_NAME = "ESP32-MIC"
 SERVICE_UUID = "e9ea0001-7dca-4e3d-9a9a-1c4f6b8e0001"
 STATUS_CHAR_UUID = "e9ea0002-7dca-4e3d-9a9a-1c4f6b8e0001"
@@ -232,7 +234,32 @@ async def find_device(name: str, address: str | None, timeout: float) -> BLEDevi
     return device
 
 
+async def transcribe_recording(audio_path: Path, args: argparse.Namespace) -> None:
+    if args.no_asr:
+        return
+    language = None if args.language.lower() in {"auto", "none", ""} else args.language
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: asr_engine.transcribe_file(
+                audio_path, language=language, context=args.context
+            ),
+        )
+    except Exception as exc:
+        print(f"语音识别失败: {exc}", file=sys.stderr)
+
+
 async def run(args: argparse.Namespace) -> None:
+    if not args.no_asr:
+        missing = asr_engine.missing_resources()
+        if missing:
+            print("未找到 Qwen3-ASR 模型或 llama.cpp 库，将只保存音频：")
+            for item in missing:
+                print(f"  {item}")
+            args.no_asr = True
+        else:
+            asr_engine.load_engine(use_gpu=not args.asr_cpu)
+
     session = RecordingSession(Path(args.output_dir))
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue()
@@ -272,20 +299,26 @@ async def run(args: argparse.Namespace) -> None:
                 try:
                     kind, payload = await asyncio.wait_for(queue.get(), timeout=timeout)
                 except TimeoutError:
-                    session.save_if_ready()
+                    saved = session.save_if_ready()
+                    if saved is not None:
+                        await transcribe_recording(saved, args)
                     continue
 
                 if kind == "status":
                     session.handle_status(payload)
                 elif kind == "audio":
                     session.handle_audio(payload)
-                session.save_if_ready()
+                saved = session.save_if_ready()
+                if saved is not None:
+                    await transcribe_recording(saved, args)
         except asyncio.CancelledError:
             raise
         finally:
             if session.pcm:
                 session.flush_at = time.monotonic()
-                session.save_if_ready()
+                saved = session.save_if_ready()
+                if saved is not None:
+                    await transcribe_recording(saved, args)
             try:
                 await client.stop_notify(AUDIO_CHAR_UUID)
                 await client.stop_notify(STATUS_CHAR_UUID)
@@ -299,6 +332,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--address", help="直接按蓝牙地址连接")
     parser.add_argument("-o", "--output-dir", default="recordings", help="MP3 输出目录")
     parser.add_argument("--timeout", type=float, default=20.0, help="扫描/连接超时秒数")
+    parser.add_argument("--no-asr", action="store_true", help="只录音，不做语音识别")
+    parser.add_argument("--asr-cpu", action="store_true", help="ASR 的 LLM 走 CPU，不用 Vulkan")
+    parser.add_argument("--language", default="Chinese", help="识别语言，auto 表示自动检测")
+    parser.add_argument("--context", default="", help="ASR 上下文提示，可提高专有名词准确率")
     return parser.parse_args()
 
 
