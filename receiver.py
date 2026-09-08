@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""连接 ESP32-S3 的 BLE 麦克风，实时接收 PCM 并在松开按钮后保存为 MP3。
+"""连接 ESP32-S3 的 BLE 麦克风，按住录音，松开后识别。
 
-ESP32-S3 只有 BLE，没有经典蓝牙。请先烧录 esp32_microphone.ino，
-再在本机打开蓝牙适配器后运行本脚本。
+ESP32-S3 只有 BLE。按下按钮开始推流，松开结束；PCM 不落盘。
+松开后用 Qwen3-ASR 识别整段，再用 Qwen3-0.6B 润色口癖，两者都打到终端。
 
 示例:
   python receiver.py
-  python receiver.py --name ESP32-MIC -o recordings
+  python receiver.py --name ESP32-MIC
   python receiver.py --address AA:BB:CC:DD:EE:FF
 """
 
@@ -14,13 +14,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import shutil
 import struct
-import subprocess
 import sys
 import time
-from datetime import datetime
-from pathlib import Path
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -39,24 +35,23 @@ STATUS_STRUCT = struct.Struct("<BIBBI")
 
 
 class RecordingSession:
-    def __init__(self, output_dir: Path) -> None:
-        self.output_dir = output_dir
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.pcm = bytearray()
+    def __init__(self, recognizer: asr_engine.StreamingRecognizer | None) -> None:
+        self.recognizer = recognizer
         self.recording = False
         self.sample_rate = 16000
         self.bits = 16
         self.channels = 1
         self.expected_bytes = 0
+        self.received_bytes = 0
         self.flush_at: float | None = None
         self.last_seq: int | None = None
         self.lost_packets = 0
         self.started_at = 0.0
 
-    def reset(self) -> None:
-        self.pcm.clear()
+    def reset_state(self) -> None:
         self.recording = False
         self.expected_bytes = 0
+        self.received_bytes = 0
         self.flush_at = None
         self.last_seq = None
         self.lost_packets = 0
@@ -73,9 +68,9 @@ class RecordingSession:
         self.channels = int(channels)
 
         if event == EVENT_START:
-            self.pcm.clear()
             self.recording = True
             self.expected_bytes = 0
+            self.received_bytes = 0
             self.flush_at = None
             self.last_seq = None
             self.lost_packets = 0
@@ -83,10 +78,12 @@ class RecordingSession:
             print(
                 f"开始录音  {self.sample_rate} Hz / {self.bits} bit / {self.channels} ch"
             )
+            if self.recognizer is not None:
+                self.recognizer.start_utterance(self.sample_rate)
             return
 
         if event == EVENT_STOP:
-            if not self.recording and not self.pcm:
+            if not self.recording and self.flush_at is None:
                 return
             self.recording = False
             self.expected_bytes = int(pcm_bytes)
@@ -115,106 +112,36 @@ class RecordingSession:
         self.last_seq = seq
 
         if self.recording or self.flush_at is not None:
-            self.pcm.extend(pcm)
+            self.received_bytes += len(pcm)
+            if self.recognizer is not None:
+                self.recognizer.feed(pcm)
 
-    def ready_to_save(self) -> bool:
+    def ready_to_finish(self) -> bool:
         if self.flush_at is None:
             return False
-        if self.expected_bytes and len(self.pcm) >= self.expected_bytes:
+        if self.expected_bytes and self.received_bytes >= self.expected_bytes:
             return True
         return time.monotonic() >= self.flush_at
 
-    def save_if_ready(self) -> Path | None:
-        if not self.ready_to_save():
-            return None
-        path = self.save()
-        self.reset()
-        return path
 
-    def save(self) -> Path | None:
-        if self.bits != 16:
-            print(f"暂不支持 {self.bits} bit 音频")
-            return None
-        if not self.pcm:
-            print("没有收到音频数据，跳过保存")
-            return None
-
-        bytes_per_sec = max(1, self.sample_rate * self.channels * (self.bits // 8))
-        duration = len(self.pcm) / bytes_per_sec
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = unique_path(self.output_dir / f"recording_{stamp}.mp3")
-
-        if self.lost_packets:
-            print(f"警告: 约丢失 {self.lost_packets} 个 BLE 音频包")
-        if self.expected_bytes and len(self.pcm) != self.expected_bytes:
-            print(
-                f"警告: 收到 {len(self.pcm)} 字节，设备声明 {self.expected_bytes} 字节"
-            )
-
-        try:
-            pcm_to_mp3(bytes(self.pcm), path, self.sample_rate, self.channels)
-        except Exception as exc:
-            wav_path = path.with_suffix(".wav")
-            print(f"MP3 编码失败 ({exc})，改存 WAV: {wav_path}")
-            pcm_to_wav(bytes(self.pcm), wav_path, self.sample_rate, self.channels)
-            print(f"已保存 {wav_path}  ({duration:.2f}s, {len(self.pcm)} 字节)")
-            return wav_path
-
-        print(f"已保存 {path}  ({duration:.2f}s, {len(self.pcm)} 字节)")
-        return path
-
-
-def unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    stem, suffix = path.stem, path.suffix
-    index = 2
-    while True:
-        candidate = path.with_name(f"{stem}_{index}{suffix}")
-        if not candidate.exists():
-            return candidate
-        index += 1
-
-
-def pcm_to_wav(pcm: bytes, path: Path, sample_rate: int, channels: int) -> None:
-    import wave
-
-    with wave.open(str(path), "wb") as wav:
-        wav.setnchannels(channels)
-        wav.setsampwidth(2)
-        wav.setframerate(sample_rate)
-        wav.writeframes(pcm)
-
-
-def pcm_to_mp3(pcm: bytes, path: Path, sample_rate: int, channels: int) -> None:
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise RuntimeError("未找到 ffmpeg，请先安装")
-
-    cmd = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-f",
-        "s16le",
-        "-ar",
-        str(sample_rate),
-        "-ac",
-        str(channels),
-        "-i",
-        "pipe:0",
-        "-c:a",
-        "libmp3lame",
-        "-b:a",
-        "64k",
-        str(path),
-    ]
-    result = subprocess.run(cmd, input=pcm, capture_output=True, check=False)
-    if result.returncode != 0:
-        err = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(err or f"ffmpeg 退出码 {result.returncode}")
+async def finish_utterance(session: RecordingSession) -> None:
+    if session.lost_packets:
+        print(f"警告: 约丢失 {session.lost_packets} 个 BLE 音频包")
+    if session.expected_bytes and session.received_bytes != session.expected_bytes:
+        print(
+            f"警告: 收到 {session.received_bytes} 字节，设备声明 {session.expected_bytes} 字节"
+        )
+    duration = 0.0
+    if session.sample_rate and session.bits and session.channels:
+        bytes_per_sec = session.sample_rate * session.channels * (session.bits // 8)
+        if bytes_per_sec:
+            duration = session.received_bytes / bytes_per_sec
+    print(f"本段音频 {duration:.2f}s")
+    if session.recognizer is not None:
+        await asyncio.get_running_loop().run_in_executor(
+            None, session.recognizer.end_utterance
+        )
+    session.reset_state()
 
 
 async def find_device(name: str, address: str | None, timeout: float) -> BLEDevice:
@@ -234,33 +161,24 @@ async def find_device(name: str, address: str | None, timeout: float) -> BLEDevi
     return device
 
 
-async def transcribe_recording(audio_path: Path, args: argparse.Namespace) -> None:
-    if args.no_asr:
-        return
-    language = None if args.language.lower() in {"auto", "none", ""} else args.language
-    try:
-        await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: asr_engine.transcribe_file(
-                audio_path, language=language, context=args.context
-            ),
-        )
-    except Exception as exc:
-        print(f"语音识别失败: {exc}", file=sys.stderr)
-
-
 async def run(args: argparse.Namespace) -> None:
+    recognizer = None
     if not args.no_asr:
         missing = asr_engine.missing_resources()
         if missing:
-            print("未找到 Qwen3-ASR 模型或 llama.cpp 库，将只保存音频：")
+            print("未找到 Qwen3-ASR 模型或 llama.cpp 库，将只接收音频：")
             for item in missing:
                 print(f"  {item}")
-            args.no_asr = True
         else:
-            asr_engine.load_engine(use_gpu=not args.asr_cpu)
+            language = None if args.language.lower() in {"auto", "none", ""} else args.language
+            recognizer = asr_engine.StreamingRecognizer(
+                language=language,
+                context=args.context,
+                use_gpu=not args.asr_cpu,
+                polish=not args.no_polish,
+            )
 
-    session = RecordingSession(Path(args.output_dir))
+    session = RecordingSession(recognizer)
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue()
     disconnected = asyncio.Event()
@@ -289,7 +207,7 @@ async def run(args: argparse.Namespace) -> None:
 
         await client.start_notify(STATUS_CHAR_UUID, on_status)
         await client.start_notify(AUDIO_CHAR_UUID, on_audio)
-        print("等待按下按钮录音，Ctrl+C 退出")
+        print("等待按下按钮说话，松开后识别，Ctrl+C 退出")
 
         try:
             while not disconnected.is_set():
@@ -299,26 +217,24 @@ async def run(args: argparse.Namespace) -> None:
                 try:
                     kind, payload = await asyncio.wait_for(queue.get(), timeout=timeout)
                 except TimeoutError:
-                    saved = session.save_if_ready()
-                    if saved is not None:
-                        await transcribe_recording(saved, args)
+                    if session.ready_to_finish():
+                        await finish_utterance(session)
                     continue
 
                 if kind == "status":
                     session.handle_status(payload)
                 elif kind == "audio":
                     session.handle_audio(payload)
-                saved = session.save_if_ready()
-                if saved is not None:
-                    await transcribe_recording(saved, args)
+                if session.ready_to_finish():
+                    await finish_utterance(session)
         except asyncio.CancelledError:
             raise
         finally:
-            if session.pcm:
+            if session.recording or session.flush_at is not None:
                 session.flush_at = time.monotonic()
-                saved = session.save_if_ready()
-                if saved is not None:
-                    await transcribe_recording(saved, args)
+                await finish_utterance(session)
+            if recognizer is not None:
+                recognizer.close()
             try:
                 await client.stop_notify(AUDIO_CHAR_UUID)
                 await client.stop_notify(STATUS_CHAR_UUID)
@@ -327,12 +243,12 @@ async def run(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="ESP32-S3 INMP441 BLE 录音接收端")
+    parser = argparse.ArgumentParser(description="ESP32-S3 INMP441 BLE 语音识别")
     parser.add_argument("--name", default=DEVICE_NAME, help="BLE 广播名称")
     parser.add_argument("--address", help="直接按蓝牙地址连接")
-    parser.add_argument("-o", "--output-dir", default="recordings", help="MP3 输出目录")
     parser.add_argument("--timeout", type=float, default=20.0, help="扫描/连接超时秒数")
-    parser.add_argument("--no-asr", action="store_true", help="只录音，不做语音识别")
+    parser.add_argument("--no-asr", action="store_true", help="只收音频，不做语音识别")
+    parser.add_argument("--no-polish", action="store_true", help="只输出 ASR，不调用 0.6B 润色")
     parser.add_argument("--asr-cpu", action="store_true", help="ASR 的 LLM 走 CPU，不用 Vulkan")
     parser.add_argument("--language", default="Chinese", help="识别语言，auto 表示自动检测")
     parser.add_argument("--context", default="", help="ASR 上下文提示，可提高专有名词准确率")
@@ -340,9 +256,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    if shutil.which("ffmpeg") is None:
-        print("未找到 ffmpeg，保存 MP3 会失败。请先安装 ffmpeg。", file=sys.stderr)
-
     args = parse_args()
     try:
         asyncio.run(run(args))
