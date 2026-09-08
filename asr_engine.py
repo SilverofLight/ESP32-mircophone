@@ -5,11 +5,13 @@
 首次使用前需要 third_party/Qwen3-ASR-GGUF、models/ 下的 0.6B 权重，
 以及 inference/bin 里的 Vulkan 版 libllama。
 
-录音过程只缓存 PCM；松开按钮后整段识别，再用 Qwen3-0.6B 润色口癖。
+录音过程只缓存 PCM。Encoder（ONNX CPU）可常驻；两个 GGUF 默认在松开按钮后
+加载，识别并润色完成后从 GPU 卸掉。
 """
 
 from __future__ import annotations
 
+import gc
 import os
 import queue
 import re
@@ -48,10 +50,12 @@ POLISH_PROMPT = (
 )
 
 _engine = None
+_encoder = None
 _polisher = None
 _lock = threading.Lock()
 _loaded = False
 _polisher_loaded = False
+_polisher_missing = False
 
 
 def missing_resources() -> list[str]:
@@ -105,50 +109,127 @@ def _prepare_runtime() -> None:
         sys.path.insert(0, vendor)
 
 
-def load_engine(*, verbose: bool = True, n_ctx: int = 2048, use_gpu: bool = True):
-    """加载识别引擎。模型常驻内存，只应调用一次。"""
-    global _engine, _loaded
+def _llm_ready(engine) -> bool:
+    model = getattr(engine, "model", None) if engine is not None else None
+    return bool(model) and bool(getattr(model, "ptr", None))
+
+
+def _free_llama_resources(ctx, model) -> None:
+    """先释放 context，再释放 model，并清空指针以免 __del__ 重复 free。"""
+    from qwen_asr_gguf.inference import llama
+
+    if ctx is not None:
+        ptr = getattr(ctx, "ptr", None)
+        if ptr:
+            llama.llama_free(ptr)
+            ctx.ptr = None
+        ctx.model = None
+    if model is not None:
+        ptr = getattr(model, "ptr", None)
+        if ptr:
+            llama.llama_model_free(ptr)
+            model.ptr = None
+
+
+def load_encoder(*, verbose: bool = True):
+    """加载 ONNX Encoder（CPU）。不占显存，可在连接 BLE 后常驻。"""
+    global _encoder
     with _lock:
-        if _loaded:
+        if _encoder is not None:
+            return _encoder
+        _prepare_runtime()
+        from qwen_asr_gguf.inference.encoder import QwenAudioEncoder
+
+        if verbose:
+            print("正在加载 ASR Encoder（ONNX CPU）...")
+        t0 = time.time()
+        _encoder = QwenAudioEncoder(
+            frontend_path=str(MODEL_DIR / "qwen3_asr_encoder_frontend.int4.onnx"),
+            backend_path=str(MODEL_DIR / "qwen3_asr_encoder_backend.int4.onnx"),
+            onnx_provider="CPU",
+            verbose=verbose,
+        )
+        if verbose:
+            print(f"ASR Encoder 就绪，耗时 {time.time() - t0:.2f} 秒")
+        return _encoder
+
+
+def _bind_asr_llm(engine, *, use_gpu: bool, n_ctx: int, verbose: bool) -> None:
+    from qwen_asr_gguf.inference import llama
+
+    llm_gguf = os.path.join(engine.config.model_dir, engine.config.llm_fn)
+    if verbose:
+        print("正在加载 Qwen3-ASR Decoder（llama.cpp Vulkan）...")
+    t0 = time.time()
+    engine.model = llama.LlamaModel(llm_gguf, use_gpu=use_gpu)
+    if not getattr(engine.model, "ptr", None):
+        raise RuntimeError("ASR Decoder 加载失败")
+    if getattr(engine, "embedding_table", None) is None:
+        engine.embedding_table = llama.get_token_embeddings_gguf(llm_gguf)
+    engine.ctx = llama.LlamaContext(
+        engine.model, n_ctx=n_ctx, n_batch=4096, embeddings=False
+    )
+    engine.ID_IM_START = engine.model.token_to_id("<|im_start|>")
+    engine.ID_IM_END = engine.model.token_to_id("<|im_end|>")
+    engine.ID_AUDIO_START = engine.model.token_to_id("<|audio_start|>")
+    engine.ID_AUDIO_END = engine.model.token_to_id("<|audio_end|>")
+    engine.ID_ASR_TEXT = engine.model.token_to_id("<asr_text>")
+    if verbose:
+        print(f"ASR Decoder 就绪，耗时 {time.time() - t0:.2f} 秒")
+
+
+def load_engine(*, verbose: bool = True, n_ctx: int = 2048, use_gpu: bool = True):
+    """加载 ASR。Encoder 可复用；GGUF Decoder 可反复加载/卸载。"""
+    global _engine, _loaded
+    encoder = load_encoder(verbose=verbose)
+    with _lock:
+        if _loaded and _llm_ready(_engine):
             return _engine
         _prepare_runtime()
         from qwen_asr_gguf.inference.asr import QwenASREngine
         from qwen_asr_gguf.inference.schema import ASREngineConfig
 
-        config = ASREngineConfig(
-            model_dir=str(MODEL_DIR),
-            encoder_frontend_fn="qwen3_asr_encoder_frontend.int4.onnx",
-            encoder_backend_fn="qwen3_asr_encoder_backend.int4.onnx",
-            llm_fn="qwen3_asr_llm.q4_k.gguf",
-            onnx_provider="CPU",
-            llm_use_gpu=use_gpu,
-            n_ctx=n_ctx,
-            chunk_size=2.0,
-            memory_num=1,
-            verbose=verbose,
-            enable_aligner=False,
-        )
-        if verbose:
-            print("正在加载 Qwen3-ASR（ONNX CPU + llama.cpp Vulkan）...")
-        t0 = time.time()
-        _engine = QwenASREngine(config=config)
-        if verbose:
-            print(f"Qwen3-ASR 就绪，耗时 {time.time() - t0:.2f} 秒")
+        if _engine is None:
+            config = ASREngineConfig(
+                model_dir=str(MODEL_DIR),
+                encoder_frontend_fn="qwen3_asr_encoder_frontend.int4.onnx",
+                encoder_backend_fn="qwen3_asr_encoder_backend.int4.onnx",
+                llm_fn="qwen3_asr_llm.q4_k.gguf",
+                onnx_provider="CPU",
+                llm_use_gpu=use_gpu,
+                n_ctx=n_ctx,
+                chunk_size=2.0,
+                memory_num=1,
+                verbose=verbose,
+                enable_aligner=False,
+            )
+            engine = QwenASREngine.__new__(QwenASREngine)
+            engine.config = config
+            engine.verbose = verbose
+            engine.encoder = encoder
+            engine.aligner = None
+            engine.embedding_table = None
+            engine.model = None
+            engine.ctx = None
+            _engine = engine
+        _bind_asr_llm(_engine, use_gpu=use_gpu, n_ctx=n_ctx, verbose=verbose)
         _loaded = True
         return _engine
 
 
 def load_polisher(*, verbose: bool = True, use_gpu: bool = True):
     """加载 Qwen3-0.6B 润色模型。与 ASR Decoder 共用 llama.cpp，但用独立上下文。"""
-    global _polisher, _polisher_loaded
+    global _polisher, _polisher_loaded, _polisher_missing
     with _lock:
-        if _polisher_loaded:
+        if _polisher_missing:
+            return None
+        if _polisher_loaded and _polisher is not None:
             return _polisher
         path = polish_model_path()
         if not path.exists():
             if verbose:
                 print(f"未找到润色模型 {path.name}，将只输出 ASR 原文")
-            _polisher_loaded = True
+            _polisher_missing = True
             _polisher = None
             return None
         _prepare_runtime()
@@ -160,12 +241,34 @@ def load_polisher(*, verbose: bool = True, use_gpu: bool = True):
         except Exception as exc:
             print(f"润色模型加载失败，将只输出 ASR: {exc}", file=sys.stderr)
             _polisher = None
-            _polisher_loaded = True
+            _polisher_loaded = False
             return None
         if verbose:
             print(f"润色模型就绪，耗时 {time.time() - t0:.2f} 秒")
         _polisher_loaded = True
         return _polisher
+
+
+def unload_gpu_models(*, verbose: bool = True) -> None:
+    """释放两个 GGUF 的 Vulkan 显存；Encoder 仍留在 CPU。"""
+    global _engine, _polisher, _loaded, _polisher_loaded
+    with _lock:
+        had = False
+        if _polisher is not None:
+            _polisher.close()
+            _polisher = None
+            had = True
+        _polisher_loaded = False
+        if _engine is not None:
+            if _llm_ready(_engine):
+                had = True
+            _free_llama_resources(getattr(_engine, "ctx", None), getattr(_engine, "model", None))
+            _engine.ctx = None
+            _engine.model = None
+        _loaded = False
+        gc.collect()
+        if verbose and had:
+            print("已卸载 GPU 模型")
 
 
 def _normalize_language(language: str | None) -> str | None:
@@ -301,21 +404,24 @@ class TextPolisher:
         raw = self.model.detokenize(out_tokens).strip()
         return _clean_polish_output(raw, original)
 
+    def close(self) -> None:
+        _free_llama_resources(self.ctx, self.model)
+        self.ctx = None
+        self.model = None
+
 
 class LiveTranscriber:
     """录音期间只缓存 PCM，松开后整段识别并润色。"""
 
     def __init__(
         self,
-        engine,
         *,
         sample_rate: int = 16000,
         language: str | None = "Chinese",
         context: str = "",
-        polisher: TextPolisher | None = None,
     ) -> None:
-        self.engine = engine
-        self.polisher = polisher
+        self.engine = None
+        self.polisher = None
         self.input_rate = sample_rate
         self.min_last_samples = max(1, int(0.2 * 16000))
         self.language = _normalize_language(language)
@@ -338,6 +444,9 @@ class LiveTranscriber:
         self.pending = np.zeros(0, dtype=np.float32)
         if audio.size < self.min_last_samples:
             print("\n识别结果为空")
+            return ""
+        if self.engine is None:
+            print("\n识别引擎未加载")
             return ""
         print("正在识别 ...")
         text = _apply_itn(
@@ -386,11 +495,13 @@ class StreamingRecognizer:
         context: str = "",
         use_gpu: bool = True,
         polish: bool = True,
+        keep_models: bool = False,
     ) -> None:
         self.language = language
         self.context = context
         self.use_gpu = use_gpu
         self.polish = polish
+        self.keep_models = keep_models
         self._queue: queue.Queue = queue.Queue()
         self._thread = threading.Thread(target=self._loop, name="asr-worker", daemon=True)
         self._thread.start()
@@ -415,34 +526,60 @@ class StreamingRecognizer:
         self._queue.put(("close", None))
 
     def _loop(self) -> None:
-        engine = load_engine(use_gpu=self.use_gpu, verbose=True)
-        polisher = load_polisher(use_gpu=self.use_gpu, verbose=True) if self.polish else None
+        _prepare_runtime()
+        load_encoder(verbose=True)
         live: LiveTranscriber | None = None
         while True:
             cmd, payload = self._queue.get()
             try:
                 if cmd == "start":
                     live = LiveTranscriber(
-                        engine,
                         sample_rate=int(payload or 16000),
                         language=self.language,
                         context=self.context,
-                        polisher=polisher,
                     )
                 elif cmd == "pcm" and live is not None:
                     live.feed_pcm16(payload)
                 elif cmd == "end":
                     done, box = payload
-                    if live is not None:
-                        box["text"] = live.finish()
-                        live = None
-                    done.set()
+                    try:
+                        if live is not None:
+                            if live.pending.size >= live.min_last_samples:
+                                live.engine = load_engine(
+                                    use_gpu=self.use_gpu, verbose=True
+                                )
+                                live.polisher = (
+                                    load_polisher(use_gpu=self.use_gpu, verbose=True)
+                                    if self.polish
+                                    else None
+                                )
+                            box["text"] = live.finish()
+                            live = None
+                    finally:
+                        if not self.keep_models:
+                            unload_gpu_models(verbose=True)
+                        done.set()
                 elif cmd == "close":
-                    if live is not None:
-                        live.finish()
+                    try:
+                        if live is not None:
+                            if live.pending.size >= live.min_last_samples:
+                                live.engine = load_engine(
+                                    use_gpu=self.use_gpu, verbose=True
+                                )
+                                live.polisher = (
+                                    load_polisher(use_gpu=self.use_gpu, verbose=True)
+                                    if self.polish
+                                    else None
+                                )
+                            live.finish()
+                    finally:
+                        live = None
+                        unload_gpu_models(verbose=True)
                     return
             except Exception as exc:
                 print(f"语音识别失败: {exc}", file=sys.stderr)
+                if not self.keep_models:
+                    unload_gpu_models(verbose=False)
                 if cmd == "end":
                     payload[0].set()
 

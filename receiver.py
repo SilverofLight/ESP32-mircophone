@@ -2,12 +2,13 @@
 """连接 ESP32-S3 的 BLE 麦克风，按住录音，松开后识别。
 
 ESP32-S3 只有 BLE。按下按钮开始推流，松开结束；PCM 不落盘。
-松开后用 Qwen3-ASR 识别整段，再用 Qwen3-0.6B 润色口癖，两者都打到终端。
+松开后加载 GPU 模型，识别整段并用 Qwen3-0.6B 润色口癖，然后卸掉显存。
 
 示例:
   python receiver.py
   python receiver.py --name ESP32-MIC
   python receiver.py --address AA:BB:CC:DD:EE:FF
+  python receiver.py --keep-models
 """
 
 from __future__ import annotations
@@ -176,6 +177,7 @@ async def run(args: argparse.Namespace) -> None:
                 context=args.context,
                 use_gpu=not args.asr_cpu,
                 polish=not args.no_polish,
+                keep_models=args.keep_models,
             )
 
     session = RecordingSession(recognizer)
@@ -207,7 +209,7 @@ async def run(args: argparse.Namespace) -> None:
 
         await client.start_notify(STATUS_CHAR_UUID, on_status)
         await client.start_notify(AUDIO_CHAR_UUID, on_audio)
-        print("等待按下按钮说话，松开后识别，Ctrl+C 退出")
+        print("等待按下按钮说话，松开后加载模型并识别，Ctrl+C 退出")
 
         try:
             while not disconnected.is_set():
@@ -249,6 +251,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=20.0, help="扫描/连接超时秒数")
     parser.add_argument("--no-asr", action="store_true", help="只收音频，不做语音识别")
     parser.add_argument("--no-polish", action="store_true", help="只输出 ASR，不调用 0.6B 润色")
+    parser.add_argument(
+        "--keep-models",
+        action="store_true",
+        help="识别后不卸载 GGUF，连续说话更快，但会一直占显存",
+    )
     parser.add_argument("--asr-cpu", action="store_true", help="ASR 的 LLM 走 CPU，不用 Vulkan")
     parser.add_argument("--language", default="Chinese", help="识别语言，auto 表示自动检测")
     parser.add_argument("--context", default="", help="ASR 上下文提示，可提高专有名词准确率")
