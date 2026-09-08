@@ -37,13 +37,21 @@ REQUIRED_MODEL_FILES = (
 )
 REQUIRED_LIBS = ("libllama.so", "libggml.so", "libggml-base.so", "libggml-vulkan.so")
 
+FILLER_RE = re.compile(
+    r"(?:呃+|额+|嗯+|啊+|唔+|哦+|噢+|欸+|诶+|"
+    r"那个|就是|"
+    r"\b(?:uh+|um+|er+|ah+|hmm+)\b)",
+    re.IGNORECASE,
+)
+CONTENT_UNIT_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9]+")
+
 POLISH_PROMPT = (
     "<|im_start|>system\n"
-    "你负责清理语音识别文本。只删除语气词、口头禅和明显口误重复，"
-    "不改变原意，不补充内容，不解释，不使用 Markdown。<|im_end|>\n"
+    "删除语音识别文本中的语气词。必须删掉所有语气词，其余文字一字不改。"
+    "禁止改写、转述、删句、补全或纠正语法。<|im_end|>\n"
     "<|im_start|>user\n"
-    "请清理下面的识别结果，删除「呃、额、嗯、啊、唔、那个、就是」这类语气词。"
-    "只输出清理后的文本。\n\n"
+    "必须删除：呃、额、嗯、啊、唔、那个、就是、uh、um、ah。"
+    "不要保留这些语气词。其余内容和标点保持原样。只输出结果。\n\n"
     "{text}<|im_end|>\n"
     "<|im_start|>assistant\n"
     "<think>\n\n</think>\n\n"
@@ -335,6 +343,38 @@ def transcribe_audio(engine, audio: np.ndarray, *, language: str | None, context
     return "".join(parts).strip()
 
 
+def _content_units(text: str) -> list[str]:
+    stripped = FILLER_RE.sub(" ", text)
+    return [m.group(0).lower() for m in CONTENT_UNIT_RE.finditer(stripped)]
+
+
+def _needs_polish(text: str) -> bool:
+    return FILLER_RE.search(text) is not None
+
+
+def _strip_fillers(text: str) -> str:
+    """确定性去掉已知语气词，并收干净留下的重复逗号和空格。"""
+    out = FILLER_RE.sub("", text)
+    out = re.sub(r"[ \t]+", " ", out)
+    out = re.sub(r"\s+([，。！？、,.!?;；])", r"\1", out)
+    out = re.sub(r"([，,]){2,}", r"\1", out)
+    out = re.sub(r"([，,])\s*(?=[。！？!?])", "", out)
+    return out.strip()
+
+
+def _polish_keeps_meaning(original: str, polished: str) -> bool:
+    """只允许少掉语气词；实词多删或多加则判为改写。"""
+    from collections import Counter
+
+    orig = Counter(_content_units(original))
+    new = Counter(_content_units(polished))
+    if orig - new:
+        return False
+    if new - orig:
+        return False
+    return True
+
+
 def _clean_polish_output(raw: str, original: str) -> str:
     text = (raw or "").strip()
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
@@ -349,11 +389,11 @@ def _clean_polish_output(raw: str, original: str) -> str:
         "",
         text,
     ).strip()
-    if not text:
-        return original
-    if len(text) > max(40, int(len(original) * 2.5)):
-        return original
-    return text
+    if not text or len(text) > max(40, int(len(original) * 1.2)):
+        return _strip_fillers(original)
+    if not _polish_keeps_meaning(original, text):
+        return _strip_fillers(original)
+    return _strip_fillers(text)
 
 
 class TextPolisher:
@@ -379,20 +419,22 @@ class TextPolisher:
         original = (text or "").strip()
         if not original:
             return ""
+        if not _needs_polish(original):
+            return original
         prompt = POLISH_PROMPT.format(text=original)
         tokens = self.model.tokenize(prompt, add_special=False, parse_special=True)
         if not tokens:
-            return original
+            return _strip_fillers(original)
         self.ctx.clear_kv_cache()
         for token in tokens:
             if self.ctx.decode_token(token) != 0:
-                return original
-        sampler = self.llama.LlamaSampler(temperature=0.2, top_k=20, top_p=0.8, seed=1)
+                return _strip_fillers(original)
+        sampler = self.llama.LlamaSampler(temperature=0.0, top_k=1, top_p=1.0, seed=1)
         out_tokens: list[int] = []
         try:
             last = sampler.sample(self.ctx)
             stop = {self.eos, self.id_im_end, -1}
-            for _ in range(256):
+            for _ in range(512):
                 if last in stop:
                     break
                 out_tokens.append(last)
