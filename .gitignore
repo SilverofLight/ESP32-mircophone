@@ -4,4 +4,5 @@ recordings/
 *.mp3
 *.wav
 .pio/
+.build/
 .vscode/
