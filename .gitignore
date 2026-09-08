@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+recordings/
+*.mp3
+*.wav
+.pio/
+.vscode/
