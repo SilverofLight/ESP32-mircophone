@@ -24,6 +24,7 @@ import time
 from bleak import BleakClient, BleakScanner
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
+from pathlib import Path
 
 import asr_engine
 
@@ -35,6 +36,7 @@ AUDIO_CHAR_UUID = "e9ea0003-7dca-4e3d-9a9a-1c4f6b8e0001"
 EVENT_STOP = 0
 EVENT_START = 1
 STATUS_STRUCT = struct.Struct("<BIBBI")
+ADDRESS_CACHE = Path(__file__).resolve().parent / ".ble_last_address"
 
 
 class RecordingSession:
@@ -147,6 +149,21 @@ async def finish_utterance(session: RecordingSession) -> None:
     session.reset_state()
 
 
+def _read_cached_address() -> str | None:
+    try:
+        text = ADDRESS_CACHE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def _write_cached_address(address: str) -> None:
+    try:
+        ADDRESS_CACHE.write_text(address.strip() + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 async def find_device(name: str, address: str | None, timeout: float) -> BLEDevice:
     if address:
         print(f"正在按地址扫描 {address} ...")
@@ -154,6 +171,14 @@ async def find_device(name: str, address: str | None, timeout: float) -> BLEDevi
         if device is None:
             raise RuntimeError(f"未找到地址为 {address} 的设备")
         return device
+
+    cached = _read_cached_address()
+    if cached:
+        print(f"正在连接上次设备 {cached} ...")
+        device = await BleakScanner.find_device_by_address(cached, timeout=min(3.0, timeout))
+        if device is not None:
+            return device
+        print("上次地址未找到，改为按名称扫描")
 
     print(f"正在扫描 BLE 设备 {name} ...")
     device = await BleakScanner.find_device_by_name(name, timeout=timeout)
@@ -165,7 +190,8 @@ async def find_device(name: str, address: str | None, timeout: float) -> BLEDevi
 
 
 async def run(args: argparse.Namespace) -> None:
-    recognizer = None
+    asr_ok = False
+    asr_kwargs: dict = {}
     if not args.no_asr:
         missing = asr_engine.missing_resources()
         if missing:
@@ -173,20 +199,22 @@ async def run(args: argparse.Namespace) -> None:
             for item in missing:
                 print(f"  {item}")
         else:
+            asr_ok = True
             language = None if args.language.lower() in {"auto", "none", ""} else args.language
-            recognizer = asr_engine.StreamingRecognizer(
-                language=language,
-                context=args.context,
-                use_gpu=not args.asr_cpu,
-                polish=not args.no_polish,
-                keep_models=args.keep_models,
-                paste=not args.no_paste,
-            )
+            asr_kwargs = {
+                "language": language,
+                "context": args.context,
+                "use_gpu": not args.asr_cpu,
+                "polish": not args.no_polish,
+                "keep_models": args.keep_models,
+                "paste": not args.no_paste,
+            }
 
-    session = RecordingSession(recognizer)
+    session = RecordingSession(None)
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue()
     disconnected = asyncio.Event()
+    recognizer = None
 
     def on_disconnect(_: BleakClient) -> None:
         print("BLE 连接已断开")
@@ -199,6 +227,7 @@ async def run(args: argparse.Namespace) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, ("audio", bytes(data)))
 
     device = await find_device(args.name, args.address, args.timeout)
+    _write_cached_address(device.address)
     print(f"找到设备: {device.name or '未知'}  [{device.address}]")
     print("正在连接 ...")
 
@@ -209,6 +238,10 @@ async def run(args: argparse.Namespace) -> None:
             print(f"已连接，MTU={client.mtu_size}（Linux 上此值可能始终显示 23）")
         except Exception:
             print("已连接")
+
+        if asr_ok:
+            recognizer = asr_engine.StreamingRecognizer(**asr_kwargs)
+            session.recognizer = recognizer
 
         await client.start_notify(STATUS_CHAR_UUID, on_status)
         await client.start_notify(AUDIO_CHAR_UUID, on_audio)

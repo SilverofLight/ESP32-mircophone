@@ -8,4 +8,4 @@ recordings/
 .vscode/
 models/
 third_party/
-logs/
+.ble_last_address

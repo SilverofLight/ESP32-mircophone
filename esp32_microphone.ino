@@ -3,6 +3,7 @@
  *
  * ESP32-S3 只有 BLE（无经典蓝牙 SPP/A2DP），因此用 GATT Notify 传输 PCM。
  * 芯片上只保留极小的 DMA / 发送缓冲，不保存完整录音。
+ * 空闲时关闭 I2S/麦克风时钟、放宽 BLE 连接间隔并降低发射功率。
  *
  * Arduino IDE 开发板设置（ESP32-S3-N16R8）:
  *   开发板: ESP32S3 Dev Module
@@ -22,6 +23,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <ESP_I2S.h>
+#include <WiFi.h>
+#include <driver/i2s_common.h>
 #include <esp_gap_ble_api.h>
 #include <string.h>
 
@@ -46,6 +49,19 @@ static const size_t I2S_READ_BYTES = 512;
 static const uint8_t EVENT_STOP = 0;
 static const uint8_t EVENT_START = 1;
 
+// BLE 连接间隔单位 1.25 ms；广播间隔单位 0.625 ms
+static const uint16_t CONN_FAST_MIN = 6;    // 7.5 ms
+static const uint16_t CONN_FAST_MAX = 12;   // 15 ms
+static const uint16_t CONN_IDLE_MIN = 40;   // 50 ms
+static const uint16_t CONN_IDLE_MAX = 80;   // 100 ms
+static const uint16_t CONN_IDLE_LATENCY = 2;
+static const uint16_t CONN_TIMEOUT = 400;   // 4 s
+static const uint16_t ADV_FAST_MIN = 0x20;  // 20 ms
+static const uint16_t ADV_FAST_MAX = 0x40;  // 40 ms
+static const uint16_t ADV_SLOW_MIN = 0x00A0;  // 100 ms
+static const uint16_t ADV_SLOW_MAX = 0x0140;  // 200 ms
+static const uint32_t ADV_FAST_MS = 30000;
+
 I2SClass i2s;
 
 BLEServer *pServer = nullptr;
@@ -54,6 +70,12 @@ BLECharacteristic *pAudioChar = nullptr;
 
 volatile bool deviceConnected = false;
 uint16_t connId = 0;
+esp_bd_addr_t peerBda = {};
+bool havePeerBda = false;
+bool i2sReady = false;
+bool i2sRunning = false;
+bool advIsFast = false;
+uint32_t advFastUntil = 0;
 
 bool buttonPressed = false;
 bool lastRawButton = false;
@@ -148,11 +170,17 @@ void sendPcm(const uint8_t *data, size_t len) {
 }
 
 void flushI2S() {
+  if (!i2sRunning) {
+    return;
+  }
   uint8_t dump[512];
   i2s.readBytes(reinterpret_cast<char *>(dump), sizeof(dump));
 }
 
 int readMicPcm16(int16_t *out, size_t maxSamples) {
+  if (!i2sRunning) {
+    return 0;
+  }
   if (use16BitTransform) {
     size_t want = (maxSamples * sizeof(int16_t)) & ~static_cast<size_t>(1);
     if (want == 0) {
@@ -185,8 +213,118 @@ int readMicPcm16(int16_t *out, size_t maxSamples) {
   return samples;
 }
 
+void startAdvertising(bool fast) {
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->stop();
+  if (fast) {
+    advertising->setMinInterval(ADV_FAST_MIN);
+    advertising->setMaxInterval(ADV_FAST_MAX);
+    advFastUntil = millis() + ADV_FAST_MS;
+  } else {
+    advertising->setMinInterval(ADV_SLOW_MIN);
+    advertising->setMaxInterval(ADV_SLOW_MAX);
+  }
+  advertising->start();
+  advIsFast = fast;
+}
+
+void maybeSlowAdvertising() {
+  if (deviceConnected || !advIsFast) {
+    return;
+  }
+  if ((int32_t)(millis() - advFastUntil) < 0) {
+    return;
+  }
+  startAdvertising(false);
+  Serial.println("广播已改为节能间隔");
+}
+
+void requestConnParams(uint16_t minInt, uint16_t maxInt, uint16_t latency) {
+  if (!deviceConnected || !havePeerBda) {
+    return;
+  }
+
+  esp_ble_conn_update_params_t connParams = {};
+  memcpy(connParams.bda, peerBda, sizeof(peerBda));
+  connParams.min_int = minInt;
+  connParams.max_int = maxInt;
+  connParams.latency = latency;
+  connParams.timeout = CONN_TIMEOUT;
+  esp_ble_gap_update_conn_params(&connParams);
+}
+
+static bool i2sChannelOk(esp_err_t err) {
+  return err == ESP_OK || err == ESP_ERR_INVALID_STATE;
+}
+
+bool initMic() {
+  if (i2sReady) {
+    return true;
+  }
+
+  i2s.setPins(I2S_SCK_PIN, I2S_WS_PIN, -1, I2S_SD_PIN);
+  if (!i2s.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO,
+                 I2S_STD_SLOT_LEFT)) {
+    Serial.println("I2S 初始化失败");
+    return false;
+  }
+
+  if (!i2s.configureRX(SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO,
+                       I2S_RX_TRANSFORM_32_TO_16)) {
+    Serial.println("I2S 16-bit 转换不可用，改用软件右移");
+    use16BitTransform = false;
+  } else {
+    use16BitTransform = true;
+    Serial.println("I2S 就绪（32-bit -> 16-bit）");
+  }
+  i2s.setTimeout(40);
+  i2sReady = true;
+  i2sRunning = true;
+  return true;
+}
+
+bool resumeMic() {
+  if (!i2sReady && !initMic()) {
+    return false;
+  }
+  if (i2sRunning) {
+    return true;
+  }
+  i2s_chan_handle_t rx = i2s.rxChan();
+  if (rx == nullptr) {
+    Serial.println("I2S RX 通道无效");
+    return false;
+  }
+  if (!i2sChannelOk(i2s_channel_enable(rx))) {
+    Serial.println("I2S 启动失败");
+    return false;
+  }
+  i2sRunning = true;
+  delay(8);
+  return true;
+}
+
+void pauseMic() {
+  if (!i2sReady || !i2sRunning) {
+    return;
+  }
+  i2s_chan_handle_t rx = i2s.rxChan();
+  if (rx != nullptr) {
+    i2sChannelOk(i2s_channel_disable(rx));
+  }
+  i2sRunning = false;
+}
+
 void startStream() {
   if (streaming) {
+    return;
+  }
+
+  requestConnParams(CONN_FAST_MIN, CONN_FAST_MAX, 0);
+  delay(30);
+
+  if (!resumeMic()) {
+    requestConnParams(CONN_IDLE_MIN, CONN_IDLE_MAX, CONN_IDLE_LATENCY);
     return;
   }
 
@@ -203,6 +341,8 @@ void startStream() {
 
 void stopStream() {
   if (!streaming) {
+    pauseMic();
+    requestConnParams(CONN_IDLE_MIN, CONN_IDLE_MAX, CONN_IDLE_LATENCY);
     return;
   }
 
@@ -215,6 +355,8 @@ void stopStream() {
   delay(8);
   notifyStatus(EVENT_STOP, pcmBytesSent);
   streaming = false;
+  pauseMic();
+  requestConnParams(CONN_IDLE_MIN, CONN_IDLE_MAX, CONN_IDLE_LATENCY);
   Serial.printf("停止录音  已发送 %u 字节\n", pcmBytesSent);
 }
 
@@ -261,14 +403,10 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server, esp_ble_gatts_cb_param_t *param) override {
     deviceConnected = true;
     connId = param->connect.conn_id;
+    memcpy(peerBda, param->connect.remote_bda, sizeof(peerBda));
+    havePeerBda = true;
 
-    esp_ble_conn_update_params_t connParams = {};
-    memcpy(connParams.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
-    connParams.min_int = 6;   // 7.5 ms
-    connParams.max_int = 12;  // 15 ms
-    connParams.latency = 0;
-    connParams.timeout = 400;  // 4 s
-    esp_ble_gap_update_conn_params(&connParams);
+    requestConnParams(CONN_IDLE_MIN, CONN_IDLE_MAX, CONN_IDLE_LATENCY);
 
     Serial.printf("BLE 已连接  conn=%u\n", connId);
     if (buttonPressed) {
@@ -279,40 +417,23 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer *server) override {
     deviceConnected = false;
     connId = 0;
+    havePeerBda = false;
     if (streaming) {
       streaming = false;
+      pauseMic();
       Serial.println("连接断开，停止传输");
     }
-    Serial.println("BLE 断开，重新广播");
+    Serial.println("BLE 断开，快速广播 30 秒");
     delay(80);
-    server->startAdvertising();
+    startAdvertising(true);
   }
 };
-
-void setupI2S() {
-  i2s.setPins(I2S_SCK_PIN, I2S_WS_PIN, -1, I2S_SD_PIN);
-  if (!i2s.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO,
-                 I2S_STD_SLOT_LEFT)) {
-    Serial.println("I2S 初始化失败");
-    while (true) {
-      delay(1000);
-    }
-  }
-
-  if (!i2s.configureRX(SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO,
-                       I2S_RX_TRANSFORM_32_TO_16)) {
-    Serial.println("I2S 16-bit 转换不可用，改用软件右移");
-    use16BitTransform = false;
-  } else {
-    Serial.println("I2S 就绪（32-bit -> 16-bit）");
-  }
-  i2s.setTimeout(40);
-}
 
 void setupBLE() {
   BLEDevice::init(DEVICE_NAME);
   BLEDevice::setMTU(517);
-  BLEDevice::setPower(ESP_PWR_LVL_P9);
+  BLEDevice::setPower(ESP_PWR_LVL_P3, ESP_BLE_PWR_TYPE_ADV);
+  BLEDevice::setPower(ESP_PWR_LVL_P3, ESP_BLE_PWR_TYPE_DEFAULT);
 
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
@@ -333,17 +454,20 @@ void setupBLE() {
   BLEAdvertising *advertising = BLEDevice::getAdvertising();
   advertising->addServiceUUID(SERVICE_UUID);
   advertising->setScanResponse(true);
-  advertising->setMinPreferred(0x06);
-  advertising->setMaxPreferred(0x0c);
-  BLEDevice::startAdvertising();
+  advertising->setMinPreferred(CONN_IDLE_MIN);
+  advertising->setMaxPreferred(CONN_IDLE_MAX);
+  startAdvertising(true);
 
-  Serial.printf("BLE 广播中，设备名: %s\n", DEVICE_NAME);
+  Serial.printf("BLE 快速广播中，设备名: %s\n", DEVICE_NAME);
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(300);
   Serial.println("\nESP32-S3 INMP441 BLE 录音");
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_OFF);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
@@ -353,7 +477,12 @@ void setup() {
   buttonPressed = false;
   lastDebounceMs = millis();
 
-  setupI2S();
+  if (!initMic()) {
+    while (true) {
+      delay(1000);
+    }
+  }
+  pauseMic();
   setupBLE();
   Serial.println("按下按钮开始录音，松开结束");
 }
@@ -383,6 +512,7 @@ void loop() {
       sendPcm(reinterpret_cast<uint8_t *>(i2sPcm16), static_cast<size_t>(samples) * 2);
     }
   } else {
-    delay(1);
+    maybeSlowAdvertising();
+    delay(10);
   }
 }
