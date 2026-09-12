@@ -14,7 +14,10 @@
  *
  * 接线见 连接.md:
  *   INMP441  SCK=IO14  SD=IO15  WS=IO16  L/R=GND
- *   按钮     IO42 -> SW5 -> GND
+ *   按钮1    IO42 按住录音
+ *   按钮2    IO41 短按退格 / 长按按住退格
+ *   按钮3    IO40
+ *   按钮4    IO39
  *   LED      IO02 -> R1 -> LED1 -> GND
  */
 
@@ -37,6 +40,9 @@ static const int I2S_SCK_PIN = 14;
 static const int I2S_SD_PIN = 15;
 static const int I2S_WS_PIN = 16;
 static const int BUTTON_PIN = 42;
+static const int BUTTON2_PIN = 41;
+static const int BUTTON3_PIN = 40;
+static const int BUTTON4_PIN = 39;
 static const int LED_PIN = 2;
 
 static const uint32_t SAMPLE_RATE = 16000;
@@ -44,10 +50,15 @@ static const uint8_t SAMPLE_BITS = 16;
 static const uint8_t CHANNELS = 1;
 static const int PCM_GAIN = 4;
 static const uint32_t DEBOUNCE_MS = 30;
+static const uint32_t LONG_PRESS_MS = 400;
 static const size_t I2S_READ_BYTES = 512;
 
 static const uint8_t EVENT_STOP = 0;
 static const uint8_t EVENT_START = 1;
+static const uint8_t EVENT_BUTTON = 2;
+static const uint8_t BUTTON_ACTION_CLICK = 1;
+static const uint8_t BUTTON_ACTION_HOLD_START = 2;
+static const uint8_t BUTTON_ACTION_HOLD_END = 3;
 
 // BLE 连接间隔单位 1.25 ms；广播间隔单位 0.625 ms
 static const uint16_t CONN_FAST_MIN = 6;    // 7.5 ms
@@ -82,6 +93,12 @@ bool lastRawButton = false;
 uint32_t lastDebounceMs = 0;
 bool streaming = false;
 
+bool button2Raw = false;
+bool button2Pressed = false;
+bool button2Holding = false;
+uint32_t button2DebounceMs = 0;
+uint32_t button2PressAt = 0;
+
 uint16_t audioSeq = 0;
 uint32_t pcmBytesSent = 0;
 bool use16BitTransform = true;
@@ -102,6 +119,17 @@ void notifyStatus(uint8_t event, uint32_t pcmBytes) {
   pkt[6] = CHANNELS;
   memcpy(pkt + 7, &pcmBytes, sizeof(pcmBytes));
 
+  pStatusChar->setValue(pkt, sizeof(pkt));
+  if (deviceConnected) {
+    pStatusChar->notify();
+  }
+}
+
+void notifyButton(uint8_t id, uint8_t action) {
+  if (pStatusChar == nullptr) {
+    return;
+  }
+  uint8_t pkt[3] = {EVENT_BUTTON, id, action};
   pStatusChar->setValue(pkt, sizeof(pkt));
   if (deviceConnected) {
     pStatusChar->notify();
@@ -376,7 +404,7 @@ void handleRelease() {
   stopStream();
 }
 
-void pollButton() {
+void pollRecordButton() {
   bool raw = digitalRead(BUTTON_PIN) == LOW;
   uint32_t now = millis();
 
@@ -393,6 +421,47 @@ void pollButton() {
       handleRelease();
     }
   }
+}
+
+void pollBackspaceButton() {
+  bool raw = digitalRead(BUTTON2_PIN) == LOW;
+  uint32_t now = millis();
+
+  if (raw != button2Raw) {
+    button2Raw = raw;
+    button2DebounceMs = now;
+  }
+
+  if ((now - button2DebounceMs) <= DEBOUNCE_MS) {
+    return;
+  }
+
+  if (button2Pressed != button2Raw) {
+    button2Pressed = button2Raw;
+    if (button2Pressed) {
+      button2Holding = false;
+      button2PressAt = now;
+    } else if (button2Holding) {
+      button2Holding = false;
+      notifyButton(2, BUTTON_ACTION_HOLD_END);
+      Serial.println("按钮2 松开长按");
+    } else {
+      notifyButton(2, BUTTON_ACTION_CLICK);
+      Serial.println("按钮2 单击退格");
+    }
+    return;
+  }
+
+  if (button2Pressed && !button2Holding && (now - button2PressAt) >= LONG_PRESS_MS) {
+    button2Holding = true;
+    notifyButton(2, BUTTON_ACTION_HOLD_START);
+    Serial.println("按钮2 长按退格");
+  }
+}
+
+void pollButtons() {
+  pollRecordButton();
+  pollBackspaceButton();
 }
 
 class ServerCallbacks : public BLEServerCallbacks {
@@ -470,12 +539,19 @@ void setup() {
   WiFi.mode(WIFI_OFF);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUTTON2_PIN, INPUT_PULLUP);
+  pinMode(BUTTON3_PIN, INPUT_PULLUP);
+  pinMode(BUTTON4_PIN, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
   lastRawButton = digitalRead(BUTTON_PIN) == LOW;
   buttonPressed = false;
   lastDebounceMs = millis();
+  button2Raw = digitalRead(BUTTON2_PIN) == LOW;
+  button2Pressed = false;
+  button2Holding = false;
+  button2DebounceMs = millis();
 
   if (!initMic()) {
     while (true) {
@@ -484,11 +560,11 @@ void setup() {
   }
   pauseMic();
   setupBLE();
-  Serial.println("按下按钮开始录音，松开结束");
+  Serial.println("按钮1 按住录音；按钮2 短按退格、长按按住退格");
 }
 
 void loop() {
-  pollButton();
+  pollButtons();
 
   if (streaming && deviceConnected) {
     int samples = readMicPcm16(i2sPcm16, sizeof(i2sPcm16) / sizeof(i2sPcm16[0]));

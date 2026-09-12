@@ -16,6 +16,9 @@ import time
 KEY_LEFTCTRL = 29
 KEY_LEFTSHIFT = 42
 KEY_V = 47
+KEY_BACKSPACE = 14
+
+_backspace_held = False
 
 TERMINAL_APP_IDS = {
     "kitty",
@@ -141,3 +144,42 @@ def paste_text(text: str) -> bool:
 
     print(f"已用 {shortcut} 粘贴润色结果到当前焦点")
     return True
+
+
+def _ydotool_key(*keys: str) -> bool:
+    ydotool = shutil.which("ydotool")
+    if ydotool is None:
+        print("未找到 ydotool，跳过按键", file=sys.stderr)
+        return False
+    try:
+        subprocess.run([ydotool, "key", *keys], check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"ydotool 按键失败: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def tap_backspace() -> bool:
+    if _ydotool_key(f"{KEY_BACKSPACE}:1", f"{KEY_BACKSPACE}:0"):
+        print("已单击退格")
+        return True
+    return False
+
+
+def hold_backspace(start: bool) -> bool:
+    global _backspace_held
+    if start:
+        if _backspace_held:
+            return True
+        if _ydotool_key(f"{KEY_BACKSPACE}:1"):
+            _backspace_held = True
+            print("已按住退格")
+            return True
+        return False
+    if not _backspace_held:
+        return True
+    if _ydotool_key(f"{KEY_BACKSPACE}:0"):
+        _backspace_held = False
+        print("已松开退格")
+        return True
+    return False

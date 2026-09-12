@@ -35,6 +35,10 @@ AUDIO_CHAR_UUID = "e9ea0003-7dca-4e3d-9a9a-1c4f6b8e0001"
 
 EVENT_STOP = 0
 EVENT_START = 1
+EVENT_BUTTON = 2
+BUTTON_ACTION_CLICK = 1
+BUTTON_ACTION_HOLD_START = 2
+BUTTON_ACTION_HOLD_END = 3
 STATUS_STRUCT = struct.Struct("<BIBBI")
 ADDRESS_CACHE = Path(__file__).resolve().parent / ".ble_last_address"
 
@@ -63,6 +67,12 @@ class RecordingSession:
         self.started_at = 0.0
 
     def handle_status(self, payload: bytes) -> None:
+        if not payload:
+            return
+        event = payload[0]
+        if event == EVENT_BUTTON:
+            self.handle_button(payload)
+            return
         if len(payload) < STATUS_STRUCT.size:
             print(f"忽略过短的状态包 ({len(payload)} 字节)")
             return
@@ -97,6 +107,23 @@ class RecordingSession:
             return
 
         print(f"未知状态事件: {event}")
+
+    def handle_button(self, payload: bytes) -> None:
+        if len(payload) < 3:
+            return
+        button_id = payload[1]
+        action = payload[2]
+        if button_id != 2:
+            print(f"按钮{button_id} 动作{action}")
+            return
+        from paste_input import hold_backspace, tap_backspace
+
+        if action == BUTTON_ACTION_CLICK:
+            tap_backspace()
+        elif action == BUTTON_ACTION_HOLD_START:
+            hold_backspace(True)
+        elif action == BUTTON_ACTION_HOLD_END:
+            hold_backspace(False)
 
     def handle_audio(self, payload: bytes) -> None:
         if len(payload) < 4:
@@ -218,6 +245,9 @@ async def run(args: argparse.Namespace) -> None:
 
     def on_disconnect(_: BleakClient) -> None:
         print("BLE 连接已断开")
+        from paste_input import hold_backspace
+
+        hold_backspace(False)
         loop.call_soon_threadsafe(disconnected.set)
 
     def on_status(_: BleakGATTCharacteristic, data: bytearray) -> None:
@@ -248,7 +278,7 @@ async def run(args: argparse.Namespace) -> None:
         hint = "松开后加载模型并识别"
         if recognizer is not None and not args.no_paste:
             hint += "，润色结果会粘贴到当前焦点"
-        print(f"等待按下按钮说话，{hint}，Ctrl+C 退出")
+        print(f"等待按下按钮说话，{hint}；按钮2 短按退格、长按按住退格，Ctrl+C 退出")
 
         try:
             while not disconnected.is_set():
