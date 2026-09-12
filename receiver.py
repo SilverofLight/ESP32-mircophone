@@ -28,6 +28,7 @@ from bleak.backends.device import BLEDevice
 from pathlib import Path
 
 import asr_engine
+import link_status
 
 DEVICE_NAME = "ESP32-MIC"
 SERVICE_UUID = "e9ea0001-7dca-4e3d-9a9a-1c4f6b8e0001"
@@ -46,8 +47,13 @@ ADDRESS_CACHE = Path(__file__).resolve().parent / ".ble_last_address"
 
 
 class RecordingSession:
-    def __init__(self, recognizer: asr_engine.StreamingRecognizer | None) -> None:
+    def __init__(
+        self,
+        recognizer: asr_engine.StreamingRecognizer | None,
+        status: link_status.LinkStatus | None = None,
+    ) -> None:
         self.recognizer = recognizer
+        self.status = status
         self.recording = False
         self.sample_rate = 16000
         self.bits = 16
@@ -162,8 +168,10 @@ class RecordingSession:
             self.reset_state()
         if self.virtual_mic is None:
             self.virtual_mic = VirtualMic()
+        if self.status is not None:
+            self.status.set_live_mic(True)
         if self.virtual_mic.start():
-            print("已作为电脑麦克风持续输入，IO38 应常亮；再按按钮4 退出")
+            print("已作为电脑麦克风持续输入；再按按钮4 退出")
         else:
             print("注册虚拟麦克风失败，仍保持设备端持续推流")
 
@@ -172,6 +180,8 @@ class RecordingSession:
             self.virtual_mic is not None and self.virtual_mic.active
         )
         self.live_mic = False
+        if self.status is not None:
+            self.status.set_live_mic(False)
         if self.virtual_mic is not None:
             self.virtual_mic.stop()
         if was_live:
@@ -248,29 +258,42 @@ def _write_cached_address(address: str) -> None:
         pass
 
 
-async def find_device(name: str, address: str | None, timeout: float) -> BLEDevice:
-    if address:
-        print(f"正在按地址扫描 {address} ...")
-        device = await BleakScanner.find_device_by_address(address, timeout=timeout)
-        if device is None:
-            raise RuntimeError(f"未找到地址为 {address} 的设备")
-        return device
+SCAN_SLICE_SEC = 4.0
+CONNECT_SLICE_SEC = 15.0
+WAIT_LOG_SEC = 20.0
 
-    cached = _read_cached_address()
-    if cached:
-        print(f"正在连接上次设备 {cached} ...")
-        device = await BleakScanner.find_device_by_address(cached, timeout=min(3.0, timeout))
-        if device is not None:
-            return device
-        print("上次地址未找到，改为按名称扫描")
 
-    print(f"正在扫描 BLE 设备 {name} ...")
-    device = await BleakScanner.find_device_by_name(name, timeout=timeout)
-    if device is None:
-        raise RuntimeError(
-            f"未找到名为 {name} 的设备。请确认 ESP32 已上电并在广播。"
-        )
-    return device
+async def find_device_forever(name: str, address: str | None) -> BLEDevice:
+    last_log = 0.0
+    while True:
+        now = time.monotonic()
+        if now - last_log >= WAIT_LOG_SEC:
+            target = address or name
+            print(f"等待设备 {target} ...")
+            last_log = now
+        try:
+            if address:
+                device = await BleakScanner.find_device_by_address(
+                    address, timeout=SCAN_SLICE_SEC
+                )
+                if device is not None:
+                    return device
+                continue
+            cached = _read_cached_address()
+            if cached:
+                device = await BleakScanner.find_device_by_address(
+                    cached, timeout=SCAN_SLICE_SEC
+                )
+                if device is not None:
+                    return device
+            device = await BleakScanner.find_device_by_name(name, timeout=SCAN_SLICE_SEC)
+            if device is not None:
+                return device
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"扫描出错，继续等待: {exc}")
+            await asyncio.sleep(1.0)
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -294,19 +317,18 @@ async def run(args: argparse.Namespace) -> None:
                 "paste": not args.no_paste,
             }
 
-    session = RecordingSession(None)
+    status = link_status.LinkStatus()
+    session = RecordingSession(None, status)
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue()
-    disconnected = asyncio.Event()
     recognizer = None
+    status.flush()
+    print(f"连接状态: {status.path}（未连接 / 已连接 / 麦克风模式）")
+    print("持续查找设备，断开后会自动重连，Ctrl+C 退出")
 
-    def on_disconnect(_: BleakClient) -> None:
-        print("BLE 连接已断开")
-        from paste_input import hold_backspace
-
-        hold_backspace(False)
-        session.stop_live_mic()
-        loop.call_soon_threadsafe(disconnected.set)
+    if asr_ok:
+        recognizer = asr_engine.StreamingRecognizer(**asr_kwargs)
+        session.recognizer = recognizer
 
     def on_status(_: BleakGATTCharacteristic, data: bytearray) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, ("status", bytes(data)))
@@ -314,71 +336,92 @@ async def run(args: argparse.Namespace) -> None:
     def on_audio(_: BleakGATTCharacteristic, data: bytearray) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, ("audio", bytes(data)))
 
-    device = await find_device(args.name, args.address, args.timeout)
-    _write_cached_address(device.address)
-    print(f"找到设备: {device.name or '未知'}  [{device.address}]")
-    print("正在连接 ...")
+    try:
+        while True:
+            status.set_connected(False)
+            device = await find_device_forever(args.name, args.address)
+            _write_cached_address(device.address)
+            status.set_device(device.address, device.name or args.name)
+            print(f"找到设备: {device.name or '未知'}  [{device.address}]")
+            print("正在连接 ...")
 
-    async with BleakClient(
-        device, disconnected_callback=on_disconnect, timeout=args.timeout
-    ) as client:
-        try:
-            print(f"已连接，MTU={client.mtu_size}（Linux 上此值可能始终显示 23）")
-        except Exception:
-            print("已连接")
+            disconnected = asyncio.Event()
 
-        if asr_ok:
-            recognizer = asr_engine.StreamingRecognizer(**asr_kwargs)
-            session.recognizer = recognizer
+            def on_disconnect(_: BleakClient) -> None:
+                print("BLE 连接已断开")
+                from paste_input import hold_backspace
 
-        await client.start_notify(STATUS_CHAR_UUID, on_status)
-        await client.start_notify(AUDIO_CHAR_UUID, on_audio)
-        hint = "松开后加载模型并识别"
-        if recognizer is not None and not args.no_paste:
-            hint += "，润色结果会粘贴到当前焦点"
-        print(
-            f"等待按下按钮说话，{hint}；按钮2 退格，按钮3 回车，按钮4 电脑麦克风，Ctrl+C 退出"
-        )
+                hold_backspace(False)
+                status.set_connected(False)
+                session.stop_live_mic()
+                loop.call_soon_threadsafe(disconnected.set)
 
-        try:
-            while not disconnected.is_set():
-                timeout = 0.05
-                if session.flush_at is not None:
-                    timeout = max(0.01, session.flush_at - time.monotonic())
+            while not queue.empty():
                 try:
-                    kind, payload = await asyncio.wait_for(queue.get(), timeout=timeout)
-                except TimeoutError:
-                    if session.ready_to_finish():
-                        await finish_utterance(session)
-                    continue
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
 
-                if kind == "status":
-                    session.handle_status(payload)
-                elif kind == "audio":
-                    session.handle_audio(payload)
-                if session.ready_to_finish():
-                    await finish_utterance(session)
-        except asyncio.CancelledError:
-            raise
-        finally:
-            if session.recording or session.flush_at is not None:
-                session.flush_at = time.monotonic()
-                await finish_utterance(session)
-            session.stop_live_mic()
-            if recognizer is not None:
-                recognizer.close()
             try:
-                await client.stop_notify(AUDIO_CHAR_UUID)
-                await client.stop_notify(STATUS_CHAR_UUID)
-            except Exception:
-                pass
+                async with BleakClient(
+                    device,
+                    disconnected_callback=on_disconnect,
+                    timeout=CONNECT_SLICE_SEC,
+                ) as client:
+                    status.set_connected(True)
+                    try:
+                        print(
+                            f"已连接，MTU={client.mtu_size}（Linux 上此值可能始终显示 23）"
+                        )
+                    except Exception:
+                        print("已连接")
+
+                    await client.start_notify(STATUS_CHAR_UUID, on_status)
+                    await client.start_notify(AUDIO_CHAR_UUID, on_audio)
+                    hint = "松开后加载模型并识别"
+                    if recognizer is not None and not args.no_paste:
+                        hint += "，润色结果会粘贴到当前焦点"
+                    print(
+                        f"等待按下按钮说话，{hint}；按钮2 退格，按钮3 回车，按钮4 电脑麦克风"
+                    )
+
+                    while not disconnected.is_set():
+                        wait = 0.05
+                        if session.flush_at is not None:
+                            wait = max(0.01, session.flush_at - time.monotonic())
+                        try:
+                            kind, payload = await asyncio.wait_for(queue.get(), timeout=wait)
+                        except TimeoutError:
+                            if session.ready_to_finish():
+                                await finish_utterance(session)
+                            continue
+
+                        if kind == "status":
+                            session.handle_status(payload)
+                        elif kind == "audio":
+                            session.handle_audio(payload)
+                        if session.ready_to_finish():
+                            await finish_utterance(session)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"连接中断，继续等待: {exc}")
+            finally:
+                if session.recording or session.flush_at is not None:
+                    session.flush_at = time.monotonic()
+                    await finish_utterance(session)
+                session.stop_live_mic()
+                status.set_connected(False)
+    finally:
+        if recognizer is not None:
+            recognizer.close()
+        status.close()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ESP32-S3 INMP441 BLE 语音识别")
     parser.add_argument("--name", default=DEVICE_NAME, help="BLE 广播名称")
     parser.add_argument("--address", help="直接按蓝牙地址连接")
-    parser.add_argument("--timeout", type=float, default=20.0, help="扫描/连接超时秒数")
     parser.add_argument("--no-asr", action="store_true", help="只收音频，不做语音识别")
     parser.add_argument("--no-polish", action="store_true", help="只输出 ASR，不调用 0.6B 润色")
     parser.add_argument(
@@ -407,6 +450,11 @@ def main() -> int:
     except Exception as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
+    finally:
+        try:
+            link_status.LinkStatus().close()
+        except Exception:
+            pass
     return 0
 
 

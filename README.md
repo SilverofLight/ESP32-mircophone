@@ -58,7 +58,7 @@ python firmware.py monitor --port /dev/ttyACM0
 python receiver.py
 ```
 
-按住按钮1 说话，松开后识别。润色结果默认粘贴到当前键盘焦点。终端窗口用 Ctrl+Shift+V，普通窗口用 Ctrl+V。
+启动后会一直在后台查找并等待 ESP32，不设超时；断开后自动继续扫描重连。按住按钮1 说话，松开后识别。润色结果默认粘贴到当前键盘焦点。终端窗口用 Ctrl+Shift+V，普通窗口用 Ctrl+V。
 
 常用参数：
 
@@ -72,6 +72,23 @@ python receiver.py --asr-cpu              # LLM 走 CPU
 ```
 
 上次连上的地址会记在 `.ble_last_address`。连错板可删这个文件。
+
+### 连接状态
+
+`receiver.py` 默认就会把当前状态写到 `$XDG_RUNTIME_DIR/esp32-mic/status`（没有该目录时用 `/tmp/esp32-mic/status`）。其他程序直接读这个 JSON 即可。`receiver.py` 退出后文件会被删掉。
+
+| `state` | `label` |
+| --- | --- |
+| `disconnected` | 未连接 |
+| `connected` | 已连接 |
+| `mic` | 麦克风模式 |
+
+```bash
+cat "$XDG_RUNTIME_DIR/esp32-mic/status"
+# {"state": "connected", "label": "已连接", "pid": 12345, "address": "...", "name": "ESP32-MIC"}
+```
+
+文件不存在表示 `receiver.py` 没在跑。
 
 ### 电脑麦克风
 
@@ -104,4 +121,5 @@ python receiver.py --asr-cpu              # LLM 走 CPU
 | `asr_engine.py` | Qwen3-ASR + 润色 |
 | `paste_input.py` | 剪贴板 + ydotool |
 | `virtual_mic.py` | PipeWire 虚拟输入 |
+| `link_status.py` | 连接状态文件，供其他程序读取 |
 | `连接.md` | 接线 |
