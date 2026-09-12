@@ -4,6 +4,7 @@
 ESP32-S3 只有 BLE。按下按钮开始推流，松开结束；PCM 不落盘。
 松开后加载 GPU 模型，识别整段并用 Qwen3-0.6B 润色口癖，然后卸掉显存。
 润色结果默认经 wl-copy + ydotool 粘贴到当前键盘焦点。
+按钮4 把本机注册为默认麦克风并持续推流，不走识别。
 
 示例:
   python receiver.py
@@ -36,6 +37,7 @@ AUDIO_CHAR_UUID = "e9ea0003-7dca-4e3d-9a9a-1c4f6b8e0001"
 EVENT_STOP = 0
 EVENT_START = 1
 EVENT_BUTTON = 2
+EVENT_LIVE = 3
 BUTTON_ACTION_CLICK = 1
 BUTTON_ACTION_HOLD_START = 2
 BUTTON_ACTION_HOLD_END = 3
@@ -56,6 +58,8 @@ class RecordingSession:
         self.last_seq: int | None = None
         self.lost_packets = 0
         self.started_at = 0.0
+        self.live_mic = False
+        self.virtual_mic = None
 
     def reset_state(self) -> None:
         self.recording = False
@@ -73,6 +77,9 @@ class RecordingSession:
         if event == EVENT_BUTTON:
             self.handle_button(payload)
             return
+        if event == EVENT_LIVE:
+            self.handle_live(payload)
+            return
         if len(payload) < STATUS_STRUCT.size:
             print(f"忽略过短的状态包 ({len(payload)} 字节)")
             return
@@ -83,6 +90,11 @@ class RecordingSession:
         self.channels = int(channels)
 
         if event == EVENT_START:
+            if self.live_mic:
+                print(
+                    f"持续麦克风推流  {self.sample_rate} Hz / {self.bits} bit / {self.channels} ch"
+                )
+                return
             self.recording = True
             self.expected_bytes = 0
             self.received_bytes = 0
@@ -98,6 +110,9 @@ class RecordingSession:
             return
 
         if event == EVENT_STOP:
+            if self.live_mic:
+                print("持续麦克风推流结束")
+                return
             if not self.recording and self.flush_at is None:
                 return
             self.recording = False
@@ -130,6 +145,38 @@ class RecordingSession:
             return
         print(f"按钮{button_id} 动作{action}")
 
+    def handle_live(self, payload: bytes) -> None:
+        if len(payload) < 2:
+            return
+        enabled = payload[1] != 0
+        if enabled:
+            self.start_live_mic()
+        else:
+            self.stop_live_mic()
+
+    def start_live_mic(self) -> None:
+        from virtual_mic import VirtualMic
+
+        self.live_mic = True
+        if self.recording or self.flush_at is not None:
+            self.reset_state()
+        if self.virtual_mic is None:
+            self.virtual_mic = VirtualMic()
+        if self.virtual_mic.start():
+            print("已作为电脑麦克风持续输入，IO38 应常亮；再按按钮4 退出")
+        else:
+            print("注册虚拟麦克风失败，仍保持设备端持续推流")
+
+    def stop_live_mic(self) -> None:
+        was_live = self.live_mic or (
+            self.virtual_mic is not None and self.virtual_mic.active
+        )
+        self.live_mic = False
+        if self.virtual_mic is not None:
+            self.virtual_mic.stop()
+        if was_live:
+            print("已退出电脑麦克风模式")
+
     def handle_audio(self, payload: bytes) -> None:
         if len(payload) < 4:
             return
@@ -147,6 +194,11 @@ class RecordingSession:
                 gap = (seq - expected) & 0xFFFF
                 self.lost_packets += gap
         self.last_seq = seq
+
+        if self.live_mic:
+            if self.virtual_mic is not None:
+                self.virtual_mic.feed(pcm)
+            return
 
         if self.recording or self.flush_at is not None:
             self.received_bytes += len(pcm)
@@ -253,6 +305,7 @@ async def run(args: argparse.Namespace) -> None:
         from paste_input import hold_backspace
 
         hold_backspace(False)
+        session.stop_live_mic()
         loop.call_soon_threadsafe(disconnected.set)
 
     def on_status(_: BleakGATTCharacteristic, data: bytearray) -> None:
@@ -284,7 +337,7 @@ async def run(args: argparse.Namespace) -> None:
         if recognizer is not None and not args.no_paste:
             hint += "，润色结果会粘贴到当前焦点"
         print(
-            f"等待按下按钮说话，{hint}；按钮2 退格，按钮3 回车，Ctrl+C 退出"
+            f"等待按下按钮说话，{hint}；按钮2 退格，按钮3 回车，按钮4 电脑麦克风，Ctrl+C 退出"
         )
 
         try:
@@ -311,6 +364,7 @@ async def run(args: argparse.Namespace) -> None:
             if session.recording or session.flush_at is not None:
                 session.flush_at = time.monotonic()
                 await finish_utterance(session)
+            session.stop_live_mic()
             if recognizer is not None:
                 recognizer.close()
             try:

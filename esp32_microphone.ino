@@ -17,8 +17,9 @@
  *   按钮1    IO42 按住录音
  *   按钮2    IO41 短按退格 / 长按按住退格
  *   按钮3    IO40 单击回车
- *   按钮4    IO39
- *   LED      IO02 -> R1 -> LED1 -> GND
+ *   按钮4    IO39 单击切换电脑麦克风（持续推流）
+ *   LED1     IO02 -> R1 -> LED1 -> GND  麦克风模式常亮 / 否则仅按钮1按下时亮
+ *   LED2     IO38 -> R2 -> LED2 -> GND  BLE 已连接常亮 / 未连接闪烁
  */
 
 #include <BLE2902.h>
@@ -27,6 +28,7 @@
 #include <BLEUtils.h>
 #include <ESP_I2S.h>
 #include <WiFi.h>
+#include <driver/gpio.h>
 #include <driver/i2s_common.h>
 #include <esp_gap_ble_api.h>
 #include <string.h>
@@ -44,6 +46,7 @@ static const int BUTTON2_PIN = 41;
 static const int BUTTON3_PIN = 40;
 static const int BUTTON4_PIN = 39;
 static const int LED_PIN = 2;
+static const gpio_num_t LED_LIVE_GPIO = GPIO_NUM_38;
 
 static const uint32_t SAMPLE_RATE = 16000;
 static const uint8_t SAMPLE_BITS = 16;
@@ -51,11 +54,13 @@ static const uint8_t CHANNELS = 1;
 static const int PCM_GAIN = 4;
 static const uint32_t DEBOUNCE_MS = 30;
 static const uint32_t LONG_PRESS_MS = 400;
+static const uint32_t BLE_LED_BLINK_MS = 400;
 static const size_t I2S_READ_BYTES = 512;
 
 static const uint8_t EVENT_STOP = 0;
 static const uint8_t EVENT_START = 1;
 static const uint8_t EVENT_BUTTON = 2;
+static const uint8_t EVENT_LIVE = 3;
 static const uint8_t BUTTON_ACTION_CLICK = 1;
 static const uint8_t BUTTON_ACTION_HOLD_START = 2;
 static const uint8_t BUTTON_ACTION_HOLD_END = 3;
@@ -101,6 +106,12 @@ uint32_t button2PressAt = 0;
 bool button3Raw = false;
 bool button3Pressed = false;
 uint32_t button3DebounceMs = 0;
+bool button4Raw = false;
+bool button4Pressed = false;
+uint32_t button4DebounceMs = 0;
+bool liveMic = false;
+uint32_t bleLedBlinkAt = 0;
+bool bleLedOn = false;
 
 uint16_t audioSeq = 0;
 uint32_t pcmBytesSent = 0;
@@ -133,6 +144,17 @@ void notifyButton(uint8_t id, uint8_t action) {
     return;
   }
   uint8_t pkt[3] = {EVENT_BUTTON, id, action};
+  pStatusChar->setValue(pkt, sizeof(pkt));
+  if (deviceConnected) {
+    pStatusChar->notify();
+  }
+}
+
+void notifyLive(uint8_t enabled) {
+  if (pStatusChar == nullptr) {
+    return;
+  }
+  uint8_t pkt[2] = {EVENT_LIVE, enabled};
   pStatusChar->setValue(pkt, sizeof(pkt));
   if (deviceConnected) {
     pStatusChar->notify();
@@ -391,8 +413,64 @@ void stopStream() {
   Serial.printf("停止录音  已发送 %u 字节\n", pcmBytesSent);
 }
 
+void initLeds() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  gpio_reset_pin(LED_LIVE_GPIO);
+  gpio_set_direction(LED_LIVE_GPIO, GPIO_MODE_OUTPUT);
+  gpio_set_drive_capability(LED_LIVE_GPIO, GPIO_DRIVE_CAP_3);
+  gpio_set_level(LED_LIVE_GPIO, 0);
+  bleLedBlinkAt = millis();
+  bleLedOn = false;
+}
+
+void updateRecordLed() {
+  digitalWrite(LED_PIN, (liveMic || buttonPressed) ? HIGH : LOW);
+}
+
+void updateBleLed() {
+  if (deviceConnected) {
+    if (!bleLedOn) {
+      gpio_set_level(LED_LIVE_GPIO, 1);
+      bleLedOn = true;
+    }
+    return;
+  }
+  uint32_t now = millis();
+  if ((now - bleLedBlinkAt) < BLE_LED_BLINK_MS) {
+    return;
+  }
+  bleLedBlinkAt = now;
+  bleLedOn = !bleLedOn;
+  gpio_set_level(LED_LIVE_GPIO, bleLedOn ? 1 : 0);
+}
+
+void setLiveMic(bool on) {
+  if (liveMic == on) {
+    return;
+  }
+  liveMic = on;
+  updateRecordLed();
+  if (on) {
+    Serial.println("进入电脑麦克风模式");
+    notifyLive(1);
+    if (deviceConnected) {
+      startStream();
+    }
+  } else {
+    Serial.println("退出电脑麦克风模式");
+    if (!buttonPressed) {
+      stopStream();
+    }
+    notifyLive(0);
+  }
+}
+
 void handlePress() {
-  digitalWrite(LED_PIN, HIGH);
+  updateRecordLed();
+  if (liveMic) {
+    return;
+  }
   Serial.println("按钮按下");
   if (deviceConnected) {
     startStream();
@@ -402,8 +480,11 @@ void handlePress() {
 }
 
 void handleRelease() {
-  digitalWrite(LED_PIN, LOW);
+  updateRecordLed();
   Serial.println("按钮松开");
+  if (liveMic) {
+    return;
+  }
   stopStream();
 }
 
@@ -484,10 +565,32 @@ void pollEnterButton() {
   }
 }
 
+void pollLiveButton() {
+  bool raw = digitalRead(BUTTON4_PIN) == LOW;
+  uint32_t now = millis();
+
+  if (raw != button4Raw) {
+    button4Raw = raw;
+    button4DebounceMs = now;
+  }
+
+  if ((now - button4DebounceMs) <= DEBOUNCE_MS) {
+    return;
+  }
+
+  if (button4Pressed != button4Raw) {
+    button4Pressed = button4Raw;
+    if (!button4Pressed) {
+      setLiveMic(!liveMic);
+    }
+  }
+}
+
 void pollButtons() {
   pollRecordButton();
   pollBackspaceButton();
   pollEnterButton();
+  pollLiveButton();
 }
 
 class ServerCallbacks : public BLEServerCallbacks {
@@ -504,8 +607,14 @@ class ServerCallbacks : public BLEServerCallbacks {
     requestConnParams(CONN_IDLE_MIN, CONN_IDLE_MAX, CONN_IDLE_LATENCY);
 
     Serial.printf("BLE 已连接  conn=%u\n", connId);
-    if (buttonPressed) {
+    if (liveMic) {
+      notifyLive(1);
       startStream();
+    } else {
+      notifyLive(0);
+      if (buttonPressed) {
+        startStream();
+      }
     }
   }
 
@@ -568,8 +677,7 @@ void setup() {
   pinMode(BUTTON2_PIN, INPUT_PULLUP);
   pinMode(BUTTON3_PIN, INPUT_PULLUP);
   pinMode(BUTTON4_PIN, INPUT_PULLUP);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  initLeds();
 
   lastRawButton = digitalRead(BUTTON_PIN) == LOW;
   buttonPressed = false;
@@ -581,6 +689,10 @@ void setup() {
   button3Raw = digitalRead(BUTTON3_PIN) == LOW;
   button3Pressed = false;
   button3DebounceMs = millis();
+  button4Raw = digitalRead(BUTTON4_PIN) == LOW;
+  button4Pressed = false;
+  button4DebounceMs = millis();
+  liveMic = false;
 
   if (!initMic()) {
     while (true) {
@@ -589,11 +701,12 @@ void setup() {
   }
   pauseMic();
   setupBLE();
-  Serial.println("按钮1 按住录音；按钮2 退格；按钮3 回车");
+  Serial.println("按钮1 按住录音；按钮2 退格；按钮3 回车；按钮4 电脑麦克风");
 }
 
 void loop() {
   pollButtons();
+  updateBleLed();
 
   if (streaming && deviceConnected) {
     int samples = readMicPcm16(i2sPcm16, sizeof(i2sPcm16) / sizeof(i2sPcm16[0]));
