@@ -21,11 +21,32 @@ INMP441：SCK=IO14，SD=IO15，WS=IO16，L/R=GND，VDD=3V3。各按钮另一端�
 
 ```bash
 pip install -r requirements.txt
-python firmware.py compile
-python firmware.py upload --port /dev/ttyACM0
 ```
 
-首次运行会安装 `arduino-cli` 和 ESP32 核心。也可用 Arduino IDE：开发板选 **ESP32S3 Dev Module**，USB CDC On Boot 开启，Flash 16MB，PSRAM 选 OPI，分区 `app3M_fat9M_16MB`。
+烧录（编译并写入板子）：
+
+```bash
+python firmware.py all --port /dev/ttyACM0
+```
+
+分步：
+
+```bash
+python firmware.py compile
+python firmware.py upload --port /dev/ttyACM0
+python firmware.py monitor --port /dev/ttyACM0
+```
+
+| 命令 | 作用 |
+| --- | --- |
+| `python firmware.py compile` | 只编译 |
+| `python firmware.py upload --port /dev/ttyACM0` | 烧录已编译固件 |
+| `python firmware.py all --port /dev/ttyACM0` | 编译并烧录 |
+| `python firmware.py monitor --port /dev/ttyACM0` | 串口监视（115200） |
+
+不写 `--port` 时会尝试自动找串口，常见是 `/dev/ttyACM0` 或 `/dev/ttyUSB0`。首次运行会安装 `arduino-cli` 和 ESP32 核心。
+
+也可用 Arduino IDE：开发板选 **ESP32S3 Dev Module**，USB CDC On Boot 开启，Flash 16MB，PSRAM 选 OPI，分区 `app3M_fat9M_16MB`。
 
 设备 BLE 名：`ESP32-MIC`。
 
