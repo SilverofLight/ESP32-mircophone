@@ -1,7 +1,7 @@
-bleak>=0.22,<4
-pyserial>=3.5
+bleak>=0.22
+numpy>=1.26
 onnxruntime>=1.20
 gguf>=0.10
 soundfile>=0.12
-numpy>=1.26
 srt>=3.5
+pyserial>=3.5
