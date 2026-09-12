@@ -113,17 +113,22 @@ class RecordingSession:
             return
         button_id = payload[1]
         action = payload[2]
-        if button_id != 2:
-            print(f"按钮{button_id} 动作{action}")
-            return
-        from paste_input import hold_backspace, tap_backspace
+        if button_id == 2:
+            from paste_input import hold_backspace, tap_backspace
 
-        if action == BUTTON_ACTION_CLICK:
-            tap_backspace()
-        elif action == BUTTON_ACTION_HOLD_START:
-            hold_backspace(True)
-        elif action == BUTTON_ACTION_HOLD_END:
-            hold_backspace(False)
+            if action == BUTTON_ACTION_CLICK:
+                tap_backspace()
+            elif action == BUTTON_ACTION_HOLD_START:
+                hold_backspace(True)
+            elif action == BUTTON_ACTION_HOLD_END:
+                hold_backspace(False)
+            return
+        if button_id == 3 and action == BUTTON_ACTION_CLICK:
+            from paste_input import tap_enter
+
+            tap_enter()
+            return
+        print(f"按钮{button_id} 动作{action}")
 
     def handle_audio(self, payload: bytes) -> None:
         if len(payload) < 4:
@@ -278,7 +283,9 @@ async def run(args: argparse.Namespace) -> None:
         hint = "松开后加载模型并识别"
         if recognizer is not None and not args.no_paste:
             hint += "，润色结果会粘贴到当前焦点"
-        print(f"等待按下按钮说话，{hint}；按钮2 短按退格、长按按住退格，Ctrl+C 退出")
+        print(
+            f"等待按下按钮说话，{hint}；按钮2 退格，按钮3 回车，Ctrl+C 退出"
+        )
 
         try:
             while not disconnected.is_set():

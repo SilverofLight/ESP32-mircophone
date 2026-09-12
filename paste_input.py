@@ -17,6 +17,7 @@ KEY_LEFTCTRL = 29
 KEY_LEFTSHIFT = 42
 KEY_V = 47
 KEY_BACKSPACE = 14
+KEY_ENTER = 28
 
 _backspace_held = False
 
@@ -181,5 +182,12 @@ def hold_backspace(start: bool) -> bool:
     if _ydotool_key(f"{KEY_BACKSPACE}:0"):
         _backspace_held = False
         print("已松开退格")
+        return True
+    return False
+
+
+def tap_enter() -> bool:
+    if _ydotool_key(f"{KEY_ENTER}:1", f"{KEY_ENTER}:0"):
+        print("已单击回车")
         return True
     return False

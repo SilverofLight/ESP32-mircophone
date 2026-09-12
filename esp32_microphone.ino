@@ -16,7 +16,7 @@
  *   INMP441  SCK=IO14  SD=IO15  WS=IO16  L/R=GND
  *   按钮1    IO42 按住录音
  *   按钮2    IO41 短按退格 / 长按按住退格
- *   按钮3    IO40
+ *   按钮3    IO40 单击回车
  *   按钮4    IO39
  *   LED      IO02 -> R1 -> LED1 -> GND
  */
@@ -98,6 +98,9 @@ bool button2Pressed = false;
 bool button2Holding = false;
 uint32_t button2DebounceMs = 0;
 uint32_t button2PressAt = 0;
+bool button3Raw = false;
+bool button3Pressed = false;
+uint32_t button3DebounceMs = 0;
 
 uint16_t audioSeq = 0;
 uint32_t pcmBytesSent = 0;
@@ -459,9 +462,32 @@ void pollBackspaceButton() {
   }
 }
 
+void pollEnterButton() {
+  bool raw = digitalRead(BUTTON3_PIN) == LOW;
+  uint32_t now = millis();
+
+  if (raw != button3Raw) {
+    button3Raw = raw;
+    button3DebounceMs = now;
+  }
+
+  if ((now - button3DebounceMs) <= DEBOUNCE_MS) {
+    return;
+  }
+
+  if (button3Pressed != button3Raw) {
+    button3Pressed = button3Raw;
+    if (!button3Pressed) {
+      notifyButton(3, BUTTON_ACTION_CLICK);
+      Serial.println("按钮3 单击回车");
+    }
+  }
+}
+
 void pollButtons() {
   pollRecordButton();
   pollBackspaceButton();
+  pollEnterButton();
 }
 
 class ServerCallbacks : public BLEServerCallbacks {
@@ -552,6 +578,9 @@ void setup() {
   button2Pressed = false;
   button2Holding = false;
   button2DebounceMs = millis();
+  button3Raw = digitalRead(BUTTON3_PIN) == LOW;
+  button3Pressed = false;
+  button3DebounceMs = millis();
 
   if (!initMic()) {
     while (true) {
@@ -560,7 +589,7 @@ void setup() {
   }
   pauseMic();
   setupBLE();
-  Serial.println("按钮1 按住录音；按钮2 短按退格、长按按住退格");
+  Serial.println("按钮1 按住录音；按钮2 退格；按钮3 回车");
 }
 
 void loop() {
